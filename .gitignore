@@ -1,0 +1,9 @@
+
+build/
+*.o
+.DS_Store
+ns
+*.log
+*.tmp
+tests
+LICENCE
