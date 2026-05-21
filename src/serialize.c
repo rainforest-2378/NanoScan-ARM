@@ -1,20 +1,20 @@
 /*
- * Database serialization (wire v2, NFA-based engine).
+ * Database serialization (wire v3, multi-word NFA engine).
  *
- *   header  ::= magic "NHS\0" | u32 version=2 | u32 pattern_count | u32 reserved
+ *   header  ::= magic "NHS\0" | u32 version=3 | u32 pattern_count | u32 reserved
  *   pattern ::= u32 flags
- *             | u8 anchor_start | u8 anchor_end | u8 n_pos | u8 reserved
- *             | u64 initial
- *             | u64 accept
- *             | u64 follow[NS_MAX_POSITIONS]
- *             | u64 byte_pos[256]
+ *             | u8 anchor_start | u8 anchor_end | u16 n_pos
+ *             | u64 initial [pwords]                    ; pwords = ceil(n_pos/64)
+ *             | u64 accept  [pwords]
+ *             | u64 follow  [n_pos * pwords]            ; row-major
+ *             | u64 byte_pos[256 * pwords]              ; row-major
  *             | u32 min_len | u32 max_len
  *             | u32 source_len | u8 source[source_len]
  *             | u32 id
  *
- * Prefilter / fast-path fields are derived and rebuilt after load.
- * Deserialize refuses on bad magic, version mismatch, sanity failure,
- * or trailing bytes.
+ * The on-disk width is `pwords` per state row -- the trailing zero words
+ * (when n_pos < NS_MAX_POSITIONS) are not stored.  Loader rehydrates
+ * into the full ns_state_t.
  */
 #include "nanoscan_internal.h"
 
@@ -26,7 +26,7 @@
 #define NS_MAGIC1 'H'
 #define NS_MAGIC2 'S'
 #define NS_MAGIC3 '\0'
-#define NS_DB_WIRE_VERSION 2u
+#define NS_DB_WIRE_VERSION 3u
 
 /* --- writer --- */
 
@@ -53,9 +53,14 @@ static void w_bytes(writer_t *w, const void *src, size_t n) {
     memcpy(w->buf + w->len, src, n);
     w->len += n;
 }
+static void w_u16(writer_t *w, uint16_t v) { w_bytes(w, &v, sizeof(v)); }
 static void w_u32(writer_t *w, uint32_t v) { w_bytes(w, &v, sizeof(v)); }
 static void w_u64(writer_t *w, uint64_t v) { w_bytes(w, &v, sizeof(v)); }
 static void w_u8 (writer_t *w, uint8_t  v) { w_bytes(w, &v, sizeof(v)); }
+
+static void w_state(writer_t *w, const ns_state_t s, unsigned pwords) {
+    for (unsigned i = 0; i < pwords; i++) w_u64(w, s[i]);
+}
 
 int ns_db_serialize(const ns_db_t *db, void **bytes, size_t *length) {
     if (!db || !bytes || !length) return -1;
@@ -69,15 +74,18 @@ int ns_db_serialize(const ns_db_t *db, void **bytes, size_t *length) {
 
     for (size_t i = 0; i < db->count; i++) {
         const ns_pattern_t *p = db->patterns[i];
+        unsigned pwords = ns_state_words_for(p->n_pos);
+
         w_u32(&w, p->flags);
         w_u8(&w, p->anchor_start);
         w_u8(&w, p->anchor_end);
-        w_u8(&w, p->n_pos);
-        w_u8(&w, 0);
-        w_u64(&w, p->initial);
-        w_u64(&w, p->accept);
-        w_bytes(&w, p->follow,   sizeof(p->follow));
-        w_bytes(&w, p->byte_pos, sizeof(p->byte_pos));
+        w_u16(&w, p->n_pos);
+        w_state(&w, p->initial, pwords);
+        w_state(&w, p->accept,  pwords);
+        for (unsigned j = 0; j < p->n_pos; j++)
+            w_state(&w, p->follow[j], pwords);
+        for (int b = 0; b < 256; b++)
+            w_state(&w, p->byte_pos[b], pwords);
         w_u32(&w, p->min_len);
         w_u32(&w, p->max_len);
         uint32_t slen = p->source ? (uint32_t)strlen(p->source) : 0;
@@ -113,6 +121,13 @@ static int r_skip_ref(reader_t *r, size_t n, const uint8_t **out) {
     if (r->pos + n > r->len) { r->bad = 1; return -1; }
     *out = r->buf + r->pos;
     r->pos += n;
+    return 0;
+}
+static int r_state(reader_t *r, ns_state_t dst, unsigned pwords) {
+    ns_state_zero(dst);
+    for (unsigned i = 0; i < pwords; i++) {
+        if (r_take(r, &dst[i], 8) != 0) return -1;
+    }
     return 0;
 }
 
@@ -151,22 +166,26 @@ ns_db_t *ns_db_deserialize(const void *bytes, size_t length) {
         db->patterns[i] = p;
 
         uint32_t flags;
-        uint8_t  as, ae, n_pos, pad;
+        uint8_t  as, ae;
+        uint16_t n_pos;
         if (r_take(&r, &flags,  4) != 0) goto bad;
         if (r_take(&r, &as,     1) != 0) goto bad;
         if (r_take(&r, &ae,     1) != 0) goto bad;
-        if (r_take(&r, &n_pos,  1) != 0) goto bad;
-        if (r_take(&r, &pad,    1) != 0) goto bad;
+        if (r_take(&r, &n_pos,  2) != 0) goto bad;
         if (n_pos == 0 || n_pos > NS_MAX_POSITIONS) goto bad;
         p->flags        = flags;
         p->anchor_start = as;
         p->anchor_end   = ae;
         p->n_pos        = n_pos;
 
-        if (r_take(&r, &p->initial, 8)               != 0) goto bad;
-        if (r_take(&r, &p->accept,  8)               != 0) goto bad;
-        if (r_take(&r, p->follow,   sizeof(p->follow))   != 0) goto bad;
-        if (r_take(&r, p->byte_pos, sizeof(p->byte_pos)) != 0) goto bad;
+        unsigned pwords = ns_state_words_for(n_pos);
+
+        if (r_state(&r, p->initial, pwords) != 0) goto bad;
+        if (r_state(&r, p->accept,  pwords) != 0) goto bad;
+        for (unsigned j = 0; j < n_pos; j++)
+            if (r_state(&r, p->follow[j], pwords) != 0) goto bad;
+        for (int b = 0; b < 256; b++)
+            if (r_state(&r, p->byte_pos[b], pwords) != 0) goto bad;
 
         if (r_take(&r, &p->min_len, 4) != 0) goto bad;
         if (r_take(&r, &p->max_len, 4) != 0) goto bad;
@@ -186,7 +205,6 @@ ns_db_t *ns_db_deserialize(const void *bytes, size_t length) {
     }
 
     if (r.pos != r.len) { ns_db_free(db); return NULL; }
-
     if (ns_db_build_prefilter(db) != 0) { ns_db_free(db); return NULL; }
     return db;
 

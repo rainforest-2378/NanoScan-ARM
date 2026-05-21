@@ -3,12 +3,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "nanoscan.h"
 
-/* Portable count-trailing-zeros for uint64_t. GCC/Clang ship the builtin;
- * MSVC has _BitScanForward64. Both compile to a single instruction on
- * AArch64/x86_64. */
+/* Portable count-trailing-zeros for uint64_t. */
 #if defined(__GNUC__) || defined(__clang__)
 static inline int ns_ctz64(uint64_t x) { return __builtin_ctzll(x); }
 #elif defined(_MSC_VER)
@@ -27,12 +26,74 @@ static inline int ns_ctz64(uint64_t x) {
 }
 #endif
 
-/* NFA position count limit: positions are stored as bits of a uint64_t.
- * A "position" is one matched atom (character / class / dot).  Quantifier
- * expansion can inflate the count, so {n,m} is bounded so the unrolled
- * NFA still fits. */
-#define NS_MAX_POSITIONS    64
-#define NS_MAX_QUANT_REPEAT 64
+/* NFA position count limit.
+ *
+ * A "position" is one matched atom (literal byte, class, '.').  The NFA
+ * state is a bitset of positions held in `NS_STATE_WORDS` 64-bit words.
+ * Bumping NS_MAX_POSITIONS scales linearly with per-pattern memory
+ * (byte_pos[256] dominates: 256 * NS_STATE_WORDS * 8 bytes).
+ *
+ *   NS_MAX_POSITIONS=256, NS_STATE_WORDS=4   -> ~8 KiB per pattern
+ *
+ * NS_MAX_QUANT_REPEAT caps {n,m} unrolling so the unrolled NFA still
+ * fits.  Practical patterns of a few hundred atoms compile fine.
+ */
+#define NS_MAX_POSITIONS    256
+#define NS_STATE_WORDS      ((NS_MAX_POSITIONS + 63) / 64)
+#define NS_MAX_QUANT_REPEAT 128
+
+typedef uint64_t ns_state_t[NS_STATE_WORDS];
+
+static inline void ns_state_zero(ns_state_t s) {
+    for (int i = 0; i < NS_STATE_WORDS; i++) s[i] = 0;
+}
+static inline void ns_state_copy(ns_state_t d, const ns_state_t s) {
+    for (int i = 0; i < NS_STATE_WORDS; i++) d[i] = s[i];
+}
+static inline void ns_state_or(ns_state_t d, const ns_state_t s) {
+    for (int i = 0; i < NS_STATE_WORDS; i++) d[i] |= s[i];
+}
+static inline void ns_state_and(ns_state_t d, const ns_state_t s) {
+    for (int i = 0; i < NS_STATE_WORDS; i++) d[i] &= s[i];
+}
+static inline int ns_state_nz(const ns_state_t s) {
+    uint64_t x = 0;
+    for (int i = 0; i < NS_STATE_WORDS; i++) x |= s[i];
+    return x != 0;
+}
+static inline int ns_state_and_nz(const ns_state_t a, const ns_state_t b) {
+    uint64_t x = 0;
+    for (int i = 0; i < NS_STATE_WORDS; i++) x |= a[i] & b[i];
+    return x != 0;
+}
+static inline int ns_state_test(const ns_state_t s, int j) {
+    return (int)((s[(unsigned)j >> 6] >> ((unsigned)j & 63)) & 1u);
+}
+static inline void ns_state_setb(ns_state_t s, int j) {
+    s[(unsigned)j >> 6] |= (uint64_t)1 << ((unsigned)j & 63);
+}
+
+/* Iterate every set bit j in `s`, executing BODY each time.
+ * BODY may reference `j` as a const int and may use `break;`/`continue;`
+ * relative to its own surrounding loop -- not relative to the macro. */
+#define NS_STATE_FOREACH(s, j, BODY)                                        \
+    do {                                                                    \
+        for (int _wi = 0; _wi < NS_STATE_WORDS; _wi++) {                    \
+            uint64_t _ww = (s)[_wi];                                        \
+            while (_ww) {                                                   \
+                int j = (_wi << 6) + ns_ctz64(_ww);                         \
+                BODY;                                                       \
+                _ww &= _ww - 1;                                             \
+            }                                                               \
+        }                                                                   \
+    } while (0)
+
+/* Number of 64-bit state words actually needed to represent n_pos
+ * positions. Used by the on-disk format to avoid storing zero tails. */
+static inline unsigned ns_state_words_for(unsigned n_pos) {
+    if (n_pos == 0) return 1;
+    return (n_pos + 63u) / 64u;
+}
 
 /* Compiled pattern: bit-parallel Glushkov NFA.
  *
@@ -46,28 +107,25 @@ static inline int ns_ctz64(uint64_t x) {
  *         | (anchor_start && i > 0 ? 0 : initial)
  *   state = reach & byte_pos[c]
  *   if state & accept -> a match ends at offset i+1
- *
- * Start-offset tracking is done by a parallel per-position uint32_t array
- * in the scanner; it is not stored on the pattern. */
+ */
 struct ns_pattern {
     char        *source;
     unsigned int flags;        /* NS_FLAG_* */
     uint8_t      anchor_start; /* '^' at start  */
     uint8_t      anchor_end;   /* '$' at end    */
-    uint8_t      n_pos;        /* 1..NS_MAX_POSITIONS */
-    uint8_t      pad0;
-    uint64_t     initial;
-    uint64_t     accept;
-    uint64_t     follow[NS_MAX_POSITIONS];
-    uint64_t     byte_pos[256];
+    uint16_t     n_pos;        /* 1..NS_MAX_POSITIONS */
+    ns_state_t   initial;
+    ns_state_t   accept;
+    ns_state_t   follow[NS_MAX_POSITIONS];
+    ns_state_t   byte_pos[256];
     uint32_t     min_len;
     uint32_t     max_len;      /* UINT32_MAX if unbounded */
 
     /* --- Derived prefilter fields, rebuilt at compile/deserialize. --- */
-    uint8_t      is_fixed_len; /* min_len == max_len && max_len != UINT32_MAX */
-    uint8_t      is_literal;   /* every position has exactly one byte */
-    uint8_t      no_anchor;    /* set when no single end-trigger byte */
-    uint8_t      anchor_byte;  /* bucket key when !no_anchor */
+    uint8_t      is_fixed_len;
+    uint8_t      is_literal;
+    uint8_t      no_anchor;
+    uint8_t      anchor_byte;
     uint8_t      literal[NS_MAX_POSITIONS]; /* valid iff is_literal */
 };
 

@@ -101,6 +101,42 @@ int main(void) {
     { hit_t w[] = { {7,0,1}, {7,0,2} };
       if (run("^\\d+", 0, "12 abc", w, 2, "anchored_digits")) return 1; }
 
+    /* End-of-buffer '$' anchor. */
+    { hit_t w[] = { {7,0,3} };
+      if (run("foo$", 0, "foo", w, 1, "dollar_match")) return 1; }
+    { if (run("foo$", 0, "foobar", NULL, 0, "dollar_nomatch_mid")) return 1; }
+    { hit_t w[] = { {7,0,3} };
+      if (run("^baz$", 0, "baz", w, 1, "anchor_both")) return 1; }
+    { if (run("^baz$", 0, "bazz", NULL, 0, "anchor_both_no")) return 1; }
+    { hit_t w[] = { {7,6,9} };
+      if (run("[a-z]+$", 0, "12345 abc", w, 1, "class_dollar")) return 1; }
+
+    /* Large NFA: pattern with ~80 positions to exercise multi-word state.
+     * "a{80}b" expands to 80 'a' atoms + one 'b' = 81 positions. */
+    { hit_t w[] = {
+        {7,0,81}, {7,0,82}, {7,0,83}, {7,0,84}
+      };
+      char text[200];
+      for (int i = 0; i < 84; i++) text[i] = 'a';
+      text[80] = 'b';  /* 80 a's then b at position 80..80, so match (0,81) */
+      /* Actually want one clean match: 80 a's + b. Build deterministic
+       * input: 80 a's, then 'b'. Expect exactly one hit (0,81). */
+      memset(text, 'a', 80);
+      text[80] = 'b';
+      text[81] = '\0';
+      hit_t w1[] = { {7,0,81} };
+      (void)w;
+      if (run("a{80}b", 0, text, w1, 1, "big_quant_80")) return 1; }
+
+    /* Even larger: 120 'a' atoms via class to push past the old 64 limit
+     * and well into the second state word. */
+    { char text[160];
+      memset(text, 'a', 120);
+      text[120] = 'X';
+      text[121] = '\0';
+      hit_t w1[] = { {7,0,121} };
+      if (run("[abc]{120}X", 0, text, w1, 1, "big_class_120")) return 1; }
+
     printf("[PASS] hs_regex\n");
     return 0;
 }

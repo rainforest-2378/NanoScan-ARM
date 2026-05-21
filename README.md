@@ -22,15 +22,15 @@ and only ever use the block-mode subset.
 - Callback termination returns `HS_SCAN_TERMINATED`, matching upstream.
 - Matches reported in **end-offset order** across the whole database.
 - Serialization: `hs_serialize_database` / `hs_deserialize_database`
-  with a versioned wire format (`"NHS\0"` v2).
+  with a versioned wire format (`"NHS\0"` v3).
 - Unsupported flags / modes / regex constructs produce
   `HS_COMPILER_ERROR` / `HS_DB_MODE_ERROR` with a readable message —
   never silently ignored.
 
 ## Supported regex grammar
 
-PCRE subset, parsed into a **bit-parallel Glushkov NFA** (≤ 64 atoms
-per pattern):
+PCRE subset, parsed into a **bit-parallel Glushkov NFA** (≤ 256 atoms
+per pattern, state held in 4×64-bit words):
 
       re     ::= ['^'] alt ['$']           ; '^' / '$' only at extreme ends
       alt    ::= concat ('|' concat)*
@@ -52,8 +52,8 @@ What's NOT supported (and fails loudly at compile time):
 - Backreferences, lookaround, named groups, possessive quantifiers,
   Unicode property escapes, `\b` word boundary.
 - `HS_FLAG_UTF8 / UCP / PREFILTER / SOM_LEFTMOST` (rejected).
-- Compiled NFA wider than **64 positions** or `{n,m}` expansions beyond
-  64 atoms.
+- Compiled NFA wider than **256 positions** or `{n,m}` expansions
+  beyond 128 atoms.
 
 If you need any of the above, keep using upstream Hyperscan. This
 project covers the common case: "compile a handful of regexes or
@@ -152,7 +152,7 @@ examples/           # minimal demos for both APIs
 ## How the engine works (1-minute version)
 
 Each pattern compiles into a **bit-parallel Glushkov NFA** held in a
-single `uint64_t`:
+fixed-size bitset of 4×`uint64_t` (up to 256 positions):
 
 - Position `j` is set in `state` iff the NFA can be at atom `j` after
   consuming the input prefix.

@@ -1,22 +1,14 @@
 /*
  * Multi-pattern block-mode scanner over bit-parallel Glushkov NFAs.
  *
- * For every input position i and every pattern k we maintain:
- *   state[k] : uint64_t bit-set of currently active NFA positions
- *   start[k][j] : earliest input offset at which position j became active
- *
- * Step:
- *   reach = (union of follow[j] for j in state[k])
+ * Per-byte step (for every active pattern k):
+ *   reach = (UNION over j in state[k] of follow[j])
  *         | (anchor_start && i > 0 ? 0 : initial)
  *   new   = reach & byte_pos[c]
- *   for each bit j in new:
- *     start_new[j] = min over predecessor paths (or i if j in initial)
+ *   if (new & accept) -> match ends at offset i+1
  *
- * Match emission: when (new & accept) != 0, the match ends at offset i+1
- * and the leftmost start across the accepting positions is the SOM.
- *
- * Fixed-length pure-literal patterns get a fast path through the
- * prefilter (anchor_byte bucket + memcmp).
+ * Fixed-length pure-literal patterns get a fast path via the prefilter
+ * (anchor_byte bucket + memcmp).
  */
 #include "nanoscan_internal.h"
 
@@ -26,29 +18,6 @@
 #include <string.h>
 
 #define INF_LEN ((uint32_t)0xFFFFFFFFu)
-
-/* ----------------------- expression split ----------------------- */
-
-static int append_branch(char ***out, size_t *count, size_t *cap,
-                         const char *expr, size_t n) {
-    if (*count == *cap) {
-        size_t nc = (*cap == 0) ? 4 : (*cap * 2);
-        char **nb = (char **)realloc(*out, nc * sizeof(char *));
-        if (!nb) return -1;
-        *out = nb;
-        *cap = nc;
-    }
-    char *s = (char *)malloc(n + 1);
-    if (!s) return -1;
-    memcpy(s, expr, n);
-    s[n] = '\0';
-    (*out)[(*count)++] = s;
-    return 0;
-}
-
-/* Top-level '|' is now handled inside the parser, so split_branches is
- * gone. ns_db_compile compiles each expression as a single NFA. The
- * caller's id maps 1:1 to one ns_pattern. */
 
 /* ----------------------- compile / free ----------------------- */
 
@@ -102,9 +71,6 @@ int ns_db_build_prefilter(ns_db_t *db) {
     db->no_anchor_n    = 0;
     memset(db->present, 0, sizeof(db->present));
 
-    /* Classify each pattern: fixed-length pure literals get a memcmp
-     * fast-path and an end-byte bucket; everything else falls back to
-     * NFA simulation. */
     for (size_t k = 0; k < db->count; k++) {
         ns_pattern_t *p = db->patterns[k];
         p->is_fixed_len = (p->min_len == p->max_len && p->max_len != INF_LEN);
@@ -114,41 +80,37 @@ int ns_db_build_prefilter(ns_db_t *db) {
         if (!p->is_fixed_len || p->min_len == 0 ||
             p->min_len > NS_MAX_POSITIONS) continue;
 
-        /* For a fixed-length pattern with min==max==n_pos, every position
-         * is mandatory. A pure literal means every column of byte_pos has
-         * popcount == 1 and the bits in byte_pos cover positions 0..n-1
-         * exactly. The simplest check: count, per position, how many
-         * bytes have that bit set, via a transposed sweep. */
-        if (p->min_len != (uint32_t)p->n_pos) {
-            /* Variable length collapsed by quantifier; skip fast path. */
-        }
-
+        /* Pure literal: every position must accept exactly one byte and
+         * positions 0..n_pos-1 must all be covered exactly once across
+         * the byte_pos table. */
         int literal_ok = (p->min_len == (uint32_t)p->n_pos);
         if (literal_ok) {
-            uint64_t covered = 0;
+            ns_state_t covered;
+            ns_state_zero(covered);
             for (int b = 0; b < 256 && literal_ok; b++) {
-                uint64_t m = p->byte_pos[b];
-                while (m) {
-                    int j = ns_ctz64(m);
-                    if (covered & ((uint64_t)1 << j)) { literal_ok = 0; break; }
-                    covered |= (uint64_t)1 << j;
-                    p->literal[j] = (uint8_t)b;
-                    m &= m - 1;
-                }
+                ns_state_t row;
+                ns_state_copy(row, p->byte_pos[b]);
+                NS_STATE_FOREACH(row, j, {
+                    if (ns_state_test(covered, j)) { literal_ok = 0; }
+                    ns_state_setb(covered, j);
+                    if (j < NS_MAX_POSITIONS) p->literal[j] = (uint8_t)b;
+                });
             }
-            if (literal_ok && covered == (((uint64_t)1 << p->n_pos) - 1 |
-                                          (p->n_pos == 64 ? ~(uint64_t)0 : 0))) {
-                p->is_literal = 1;
+            if (literal_ok) {
+                /* All n_pos positions covered? */
+                for (int i = 0; i < p->n_pos && literal_ok; i++) {
+                    if (!ns_state_test(covered, i)) literal_ok = 0;
+                }
+                if (literal_ok) p->is_literal = 1;
             }
         }
 
-        /* End-trigger byte: look at the accept set's last position(s). If
-         * exactly one byte triggers any accept bit and the pattern is
-         * fixed-length, we can bucket by that byte. */
+        /* End-trigger byte: exactly one byte must, for a fixed-length
+         * pattern, contain any of the accept positions. */
         uint8_t the = 0;
         unsigned cnt = 0;
         for (int b = 0; b < 256; b++) {
-            if (p->byte_pos[b] & p->accept) {
+            if (ns_state_and_nz(p->byte_pos[b], p->accept)) {
                 cnt++;
                 the = (uint8_t)b;
                 if (cnt > 1) break;
@@ -187,10 +149,6 @@ int ns_db_build_prefilter(ns_db_t *db) {
         }
     }
 
-    /* append_branch is referenced from the legacy path; reference it here
-     * so the linker doesn't strip the symbol if a future caller wants
-     * to reuse it. */
-    (void)append_branch;
     return 0;
 }
 
@@ -225,75 +183,73 @@ static inline void mark_fired_by_id(const ns_db_t *db, unsigned int id,
 /* ----------------------- NFA step ----------------------- */
 
 /* Update one NFA by one byte. Returns 1 if a match ended at offset i+1
- * and writes its SOM to *out_from, otherwise 0. */
+ * and writes its SOM to *out_from, otherwise 0.
+ *
+ * `state`     : ns_state_t bitset for this pattern, updated in-place
+ * `start`     : per-position SOM array (NS_MAX_POSITIONS entries)
+ * `i,len,c`   : current byte index, total length, byte value
+ */
 static inline int nfa_step(const ns_pattern_t *p,
-                           uint64_t            *state,
+                           ns_state_t           state,
                            uint32_t            *start,
                            size_t               i,
                            size_t               len,
                            uint8_t              c,
                            size_t              *out_from) {
-    uint64_t reach = 0;
-    uint64_t s = *state;
-    while (s) {
-        int j = ns_ctz64(s);
-        reach |= p->follow[j];
-        s &= s - 1;
-    }
+    ns_state_t reach;
+    ns_state_zero(reach);
+
+    NS_STATE_FOREACH(state, j, {
+        ns_state_or(reach, p->follow[j]);
+    });
+
     int allow_restart = !(p->anchor_start && i > 0);
-    if (allow_restart) reach |= p->initial;
+    if (allow_restart) ns_state_or(reach, p->initial);
 
-    uint64_t newst = reach & p->byte_pos[c];
+    ns_state_t newst;
+    ns_state_copy(newst, reach);
+    ns_state_and (newst, p->byte_pos[c]);
 
-    /* Build new start[] in scratch then commit. */
+    /* new_start[j] for each bit j set in newst. */
     uint32_t new_start[NS_MAX_POSITIONS];
-    uint64_t ns_mask = newst;
-    while (ns_mask) {
-        int j = ns_ctz64(ns_mask);
+    NS_STATE_FOREACH(newst, j, {
         new_start[j] = UINT32_MAX;
-        ns_mask &= ns_mask - 1;
-    }
+    });
+
     if (allow_restart) {
-        uint64_t fr = p->initial & newst;
-        while (fr) {
-            int j = ns_ctz64(fr);
+        ns_state_t fr;
+        ns_state_copy(fr, p->initial);
+        ns_state_and (fr, newst);
+        NS_STATE_FOREACH(fr, j, {
             if ((uint32_t)i < new_start[j]) new_start[j] = (uint32_t)i;
-            fr &= fr - 1;
-        }
+        });
     }
-    uint64_t old = *state;
-    while (old) {
-        int k = ns_ctz64(old);
-        uint64_t reachable = p->follow[k] & newst;
-        while (reachable) {
-            int j = ns_ctz64(reachable);
+
+    NS_STATE_FOREACH(state, k, {
+        ns_state_t reachable;
+        ns_state_copy(reachable, p->follow[k]);
+        ns_state_and (reachable, newst);
+        NS_STATE_FOREACH(reachable, j, {
             if (start[k] < new_start[j]) new_start[j] = start[k];
-            reachable &= reachable - 1;
-        }
-        old &= old - 1;
-    }
+        });
+    });
 
     /* Commit. */
-    *state = newst;
-    {
-        uint64_t m = newst;
-        while (m) {
-            int j = ns_ctz64(m);
-            start[j] = new_start[j];
-            m &= m - 1;
-        }
-    }
+    ns_state_copy(state, newst);
+    NS_STATE_FOREACH(newst, j, {
+        start[j] = new_start[j];
+    });
 
-    uint64_t acc = newst & p->accept;
-    if (!acc) return 0;
+    if (!ns_state_and_nz(newst, p->accept)) return 0;
     if (p->anchor_end && i + 1 != len) return 0;
 
     uint32_t som = UINT32_MAX;
-    while (acc) {
-        int j = ns_ctz64(acc);
+    ns_state_t acc;
+    ns_state_copy(acc, newst);
+    ns_state_and (acc, p->accept);
+    NS_STATE_FOREACH(acc, j, {
         if (start[j] < som) som = start[j];
-        acc &= acc - 1;
-    }
+    });
     *out_from = som;
     return 1;
 }
@@ -314,8 +270,8 @@ size_t ns_db_scan(const ns_db_t   *db,
     const uint32_t na = db->no_anchor_n;
 
     unsigned char *fired = (unsigned char *)calloc(db->count, 1);
-    uint64_t      *state = na ? (uint64_t *)calloc(na, sizeof(uint64_t)) : NULL;
-    /* start[k*64 + j] : SOM for position j in pattern db->no_anchor_list[k] */
+    ns_state_t    *state = na ? (ns_state_t *)calloc(na, sizeof(ns_state_t)) : NULL;
+    /* start[k*NS_MAX_POSITIONS + j] : SOM for position j in pattern k. */
     uint32_t      *start = na ? (uint32_t *)malloc(na * NS_MAX_POSITIONS *
                                                    sizeof(uint32_t)) : NULL;
     if (!fired || (na && (!state || !start))) {
@@ -328,17 +284,16 @@ size_t ns_db_scan(const ns_db_t   *db,
     for (size_t i = 0; i < len && !stop; i++) {
         uint8_t c = T[i];
 
-        /* NFA fallback pass: handles all variable-length / class /
-         * quantifier patterns. */
+        /* NFA fallback pass for variable-length / no-end-trigger patterns. */
         for (uint32_t kk = 0; kk < na && !stop; kk++) {
             uint32_t k = db->no_anchor_list[kk];
             const ns_pattern_t *p = db->patterns[k];
             if ((p->flags & NS_FLAG_SINGLEMATCH) && fired[k]) {
-                state[kk] = 0;
+                ns_state_zero(state[kk]);
                 continue;
             }
             size_t from = 0;
-            if (!nfa_step(p, &state[kk], &start[kk * NS_MAX_POSITIONS],
+            if (!nfa_step(p, state[kk], &start[kk * NS_MAX_POSITIONS],
                           i, len, c, &from)) continue;
 
             total++;
@@ -350,8 +305,7 @@ size_t ns_db_scan(const ns_db_t   *db,
             }
         }
 
-        /* Bucketed pass: fixed-length literals trigger only when the
-         * current byte equals their end byte. */
+        /* Bucketed pass: fixed-length patterns triggered by current byte. */
         if (!db->present[c]) continue;
         uint32_t       n    = db->bucket_n[c];
         const uint32_t *idxs = db->bucket_idx[c];
@@ -362,30 +316,29 @@ size_t ns_db_scan(const ns_db_t   *db,
             if (i + 1 < p->min_len) continue;
 
             size_t start_off = i + 1 - p->min_len;
-            if (p->anchor_start && start_off != 0)        continue;
-            if (p->anchor_end   && i + 1   != len)        continue;
+            if (p->anchor_start && start_off != 0) continue;
+            if (p->anchor_end   && i + 1   != len) continue;
 
             if (p->is_literal) {
                 if (!verify_literal(p, T + start_off)) continue;
             } else {
-                /* Fixed-length with classes: run NFA forward over the
-                 * candidate window to confirm. Cheaper than full NFA scan
-                 * because the window is exactly min_len bytes. */
-                uint64_t st = p->initial & p->byte_pos[T[start_off]];
-                if (!st) continue;
+                /* Fixed-length with classes: forward NFA over window. */
+                ns_state_t st;
+                ns_state_copy(st, p->initial);
+                ns_state_and (st, p->byte_pos[T[start_off]]);
+                if (!ns_state_nz(st)) continue;
                 int ok = 1;
                 for (uint32_t j = 1; j < p->min_len; j++) {
-                    uint64_t reach = 0;
-                    uint64_t s = st;
-                    while (s) {
-                        int b = ns_ctz64(s);
-                        reach |= p->follow[b];
-                        s &= s - 1;
-                    }
-                    st = reach & p->byte_pos[T[start_off + j]];
-                    if (!st) { ok = 0; break; }
+                    ns_state_t reach;
+                    ns_state_zero(reach);
+                    NS_STATE_FOREACH(st, b, {
+                        ns_state_or(reach, p->follow[b]);
+                    });
+                    ns_state_copy(st, reach);
+                    ns_state_and (st, p->byte_pos[T[start_off + j]]);
+                    if (!ns_state_nz(st)) { ok = 0; break; }
                 }
-                if (!ok || !(st & p->accept)) continue;
+                if (!ok || !ns_state_and_nz(st, p->accept)) continue;
             }
 
             total++;

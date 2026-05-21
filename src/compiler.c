@@ -5,24 +5,19 @@
  *
  *   re      ::= ['^'] alt ['$']        ; '^' / '$' only at the very ends
  *   alt     ::= concat ('|' concat)*
- *   concat  ::= quant+                  ; at least one quant
+ *   concat  ::= quant+
  *   quant   ::= atom suffix?
  *   suffix  ::= '?' | '*' | '+'
  *             | '{' n '}' | '{' n ',' '}' | '{' n ',' m '}'
  *   atom    ::= literal | '.' | '\' esc
  *             | '[' class ']' | '(' [?:]? alt ')'
  *
- *   class   ::= ['^'] item+
- *   item    ::= char ('-' char)? | '\' esc
- *
- *   esc     ::= . \\ | n r t f v 0
- *             | ^ $ ( ) [ ] { } ? * + . | -
- *             | d D w W s S
- *
  * Quantifiers / classes / groups all expand into a bit-parallel Glushkov
- * NFA. Reverse references are NOT supported. SOM is computed exactly by
- * the scanner via a per-position start-offset table, so `from` is the
- * leftmost start of the match (better than upstream Hyperscan's default).
+ * NFA. NFA position width is configured by NS_MAX_POSITIONS in
+ * nanoscan_internal.h. The state is held in NS_STATE_WORDS 64-bit words.
+ *
+ * Reverse references are NOT supported. SOM is computed exactly by the
+ * scanner via a per-position start-offset table.
  */
 #include "nanoscan_internal.h"
 
@@ -62,13 +57,11 @@ static int  bs_first(const byteset_t bs) {
     for (int b = 0; b < 256; b++) if (bs_get(bs, b)) return b;
     return -1;
 }
-
 static void bs_set_range(byteset_t bs, int lo, int hi) {
     if (lo < 0) lo = 0;
     if (hi > 255) hi = 255;
     for (int b = lo; b <= hi; b++) bs_set(bs, b);
 }
-
 static void bs_apply_caseless(byteset_t bs) {
     for (int b = 'a'; b <= 'z'; b++) {
         int U = b - 'a' + 'A';
@@ -77,7 +70,6 @@ static void bs_apply_caseless(byteset_t bs) {
     }
 }
 
-/* Predefined classes (\d \w \s). */
 static void bs_class_d(byteset_t bs) { bs_clear(bs); bs_set_range(bs, '0', '9'); }
 static void bs_class_w(byteset_t bs) {
     bs_clear(bs);
@@ -160,8 +152,6 @@ static node_t *clone_ast(const node_t *n) {
     return c;
 }
 
-/* Expand `body{n,m}` (m == -1 means unbounded). Takes ownership of body
- * by cloning it as needed and freeing the original at the end. */
 static node_t *repeat_range(node_t *body, int n, int m, char *err, size_t err_cap) {
     if (n < 0) n = 0;
     if (m >= 0 && m < n) {
@@ -184,7 +174,6 @@ static node_t *repeat_range(node_t *body, int n, int m, char *err, size_t err_ca
         if (!result) goto oom;
     }
     if (m < 0) {
-        /* {n,} -> body{n} · body* */
         node_t *c = clone_ast(body);
         if (!c) goto oom;
         node_t *star = node_unary(N_STAR, c);
@@ -224,9 +213,6 @@ typedef struct {
 
 static node_t *parse_alt(parser_t *p);
 
-/* Returns 1 on success and writes the byte set into `out`. Position
- * advances past the escape character. Handles both inside-class and
- * outside-class escapes. */
 static int parse_escape(parser_t *p, byteset_t out) {
     if (p->i >= p->n) {
         set_err(p->err, p->err_cap, "trailing '\\' at end of pattern");
@@ -260,7 +246,6 @@ static int parse_escape(parser_t *p, byteset_t out) {
     }
 }
 
-/* Parse "[...]" starting after the '['. Leaves p->i past the ']'. */
 static node_t *parse_class(parser_t *p) {
     int negate = 0;
     if (p->i < p->n && p->re[p->i] == '^') { negate = 1; p->i++; }
@@ -283,11 +268,9 @@ static node_t *parse_class(parser_t *p) {
             bs_set(one, lo);
         }
 
-        /* range? "a-b" but only if both sides are single literal chars,
-         * and the '-' isn't the closing ']'. */
         if (lo >= 0 && p->i + 1 < p->n &&
             p->re[p->i] == '-' && p->re[p->i + 1] != ']') {
-            p->i++; /* consume '-' */
+            p->i++;
             int hi;
             byteset_t two; bs_clear(two);
             if (p->re[p->i] == '\\') {
@@ -316,7 +299,7 @@ static node_t *parse_class(parser_t *p) {
         set_err(p->err, p->err_cap, "unterminated character class");
         return NULL;
     }
-    p->i++; /* consume ']' */
+    p->i++;
 
     if (negate) bs_negate(bs);
     if (p->flags & NS_FLAG_CASELESS) bs_apply_caseless(bs);
@@ -365,8 +348,6 @@ static node_t *parse_atom(parser_t *p) {
         if (p->flags & NS_FLAG_CASELESS) bs_apply_caseless(bs);
         return node_atom(bs);
     }
-    /* Reject orphan meta. '^' and '$' are stripped before parse_alt is
-     * called, so reaching them here is invalid. */
     if (c == '|' || c == ')' || c == ']' || c == '}' ||
         c == '?' || c == '*' || c == '+' || c == '{' ||
         c == '^' || c == '$') {
@@ -374,7 +355,6 @@ static node_t *parse_atom(parser_t *p) {
                 "unexpected '%c' at offset %zu", c, p->i);
         return NULL;
     }
-    /* Plain literal byte. */
     p->i++;
     byteset_t bs; bs_clear(bs);
     bs_set(bs, (uint8_t)c);
@@ -395,7 +375,6 @@ static node_t *parse_quant(parser_t *p) {
         p->i++;
         int n = 0, m = -1;
         if (p->i >= p->n || !isdigit((unsigned char)p->re[p->i])) {
-            /* Not a valid quantifier; treat '{' as literal. */
             p->i = save;
             return a;
         }
@@ -450,11 +429,11 @@ static node_t *parse_alt(parser_t *p) {
 /* --------------------------- Glushkov NFA --------------------------- */
 
 typedef struct {
-    int      nullable;
-    uint64_t first;
-    uint64_t last;
-    uint32_t min_len;
-    uint32_t max_len;
+    int        nullable;
+    ns_state_t first;
+    ns_state_t last;
+    uint32_t   min_len;
+    uint32_t   max_len;
 } gl_t;
 
 static uint32_t add_sat(uint32_t a, uint32_t b) {
@@ -487,31 +466,37 @@ static int assign_positions(node_t *n, node_t **pos_nodes, int *next,
     return 0;
 }
 
-static gl_t glushkov(node_t *n, uint64_t *follow) {
-    gl_t r = {1, 0, 0, 0, 0};
+static gl_t glushkov(node_t *n, ns_state_t *follow) {
+    gl_t r;
+    r.nullable = 1;
+    ns_state_zero(r.first);
+    ns_state_zero(r.last);
+    r.min_len = 0;
+    r.max_len = 0;
     if (!n) return r;
+
     switch (n->kind) {
         case N_EMPTY:
             return r;
         case N_ATOM: {
-            uint64_t bit = (uint64_t)1 << n->pos;
             r.nullable = 0;
-            r.first = bit; r.last = bit;
-            r.min_len = 1; r.max_len = 1;
+            ns_state_setb(r.first, n->pos);
+            ns_state_setb(r.last,  n->pos);
+            r.min_len = 1;
+            r.max_len = 1;
             return r;
         }
         case N_CONCAT: {
             gl_t A = glushkov(n->a, follow);
             gl_t B = glushkov(n->b, follow);
-            uint64_t s = A.last;
-            while (s) {
-                int j = ns_ctz64(s);
-                follow[j] |= B.first;
-                s &= s - 1;
-            }
+            NS_STATE_FOREACH(A.last, j, {
+                ns_state_or(follow[j], B.first);
+            });
             r.nullable = A.nullable && B.nullable;
-            r.first = A.first | (A.nullable ? B.first : 0);
-            r.last  = B.last  | (B.nullable ? A.last  : 0);
+            ns_state_copy(r.first, A.first);
+            if (A.nullable) ns_state_or(r.first, B.first);
+            ns_state_copy(r.last, B.last);
+            if (B.nullable) ns_state_or(r.last, A.last);
             r.min_len = add_sat(A.min_len, B.min_len);
             r.max_len = add_sat(A.max_len, B.max_len);
             return r;
@@ -520,8 +505,10 @@ static gl_t glushkov(node_t *n, uint64_t *follow) {
             gl_t A = glushkov(n->a, follow);
             gl_t B = glushkov(n->b, follow);
             r.nullable = A.nullable || B.nullable;
-            r.first = A.first | B.first;
-            r.last  = A.last  | B.last;
+            ns_state_copy(r.first, A.first);
+            ns_state_or  (r.first, B.first);
+            ns_state_copy(r.last,  A.last);
+            ns_state_or  (r.last,  B.last);
             r.min_len = min_u32(A.min_len, B.min_len);
             r.max_len = max_u32(A.max_len, B.max_len);
             return r;
@@ -529,33 +516,32 @@ static gl_t glushkov(node_t *n, uint64_t *follow) {
         case N_QUEST: {
             gl_t C = glushkov(n->a, follow);
             r.nullable = 1;
-            r.first = C.first; r.last = C.last;
-            r.min_len = 0; r.max_len = C.max_len;
+            ns_state_copy(r.first, C.first);
+            ns_state_copy(r.last,  C.last);
+            r.min_len = 0;
+            r.max_len = C.max_len;
             return r;
         }
         case N_STAR: {
             gl_t C = glushkov(n->a, follow);
-            uint64_t s = C.last;
-            while (s) {
-                int j = ns_ctz64(s);
-                follow[j] |= C.first;
-                s &= s - 1;
-            }
+            NS_STATE_FOREACH(C.last, j, {
+                ns_state_or(follow[j], C.first);
+            });
             r.nullable = 1;
-            r.first = C.first; r.last = C.last;
-            r.min_len = 0; r.max_len = INF_LEN;
+            ns_state_copy(r.first, C.first);
+            ns_state_copy(r.last,  C.last);
+            r.min_len = 0;
+            r.max_len = INF_LEN;
             return r;
         }
         case N_PLUS: {
             gl_t C = glushkov(n->a, follow);
-            uint64_t s = C.last;
-            while (s) {
-                int j = ns_ctz64(s);
-                follow[j] |= C.first;
-                s &= s - 1;
-            }
+            NS_STATE_FOREACH(C.last, j, {
+                ns_state_or(follow[j], C.first);
+            });
             r.nullable = C.nullable;
-            r.first = C.first; r.last = C.last;
+            ns_state_copy(r.first, C.first);
+            ns_state_copy(r.last,  C.last);
             r.min_len = C.min_len;
             r.max_len = INF_LEN;
             return r;
@@ -579,10 +565,6 @@ ns_pattern_t *ns_compile(const char *re, unsigned int flags,
     size_t lo = 0, hi = n;
 
     if (hi > lo && re[lo] == '^') { anc_start = 1; lo++; }
-    /* `$` is end-of-pattern anchor only when it is the last char and not
-     * escaped. Since escapes are `\$`, the unescaped trailing '$' is at
-     * re[hi-1] and preceded by an even number of trailing backslashes
-     * (zero in practice). Keep the check simple. */
     if (hi > lo && re[hi - 1] == '$' &&
         (hi - 1 == 0 || re[hi - 2] != '\\')) {
         anc_end = 1;
@@ -598,10 +580,11 @@ ns_pattern_t *ns_compile(const char *re, unsigned int flags,
         return NULL;
     }
 
-    /* Assign positions left-to-right. */
-    node_t *pos_nodes[NS_MAX_POSITIONS] = {0};
+    node_t **pos_nodes = (node_t **)calloc(NS_MAX_POSITIONS, sizeof(node_t *));
+    if (!pos_nodes) { node_free(ast); set_err(err, err_cap, "out of memory"); return NULL; }
     int next = 0;
     if (assign_positions(ast, pos_nodes, &next, err, err_cap) != 0) {
+        free(pos_nodes);
         node_free(ast);
         return NULL;
     }
@@ -612,49 +595,66 @@ ns_pattern_t *ns_compile(const char *re, unsigned int flags,
         } else {
             set_err(err, err_cap, "empty patterns are accepted but never match");
         }
+        free(pos_nodes);
         node_free(ast);
         return NULL;
     }
 
     ns_pattern_t *p = (ns_pattern_t *)calloc(1, sizeof(*p));
-    if (!p) { node_free(ast); set_err(err, err_cap, "out of memory"); return NULL; }
+    if (!p) {
+        free(pos_nodes);
+        node_free(ast);
+        set_err(err, err_cap, "out of memory");
+        return NULL;
+    }
 
-    uint64_t follow[NS_MAX_POSITIONS] = {0};
+    /* Allocate follow on the heap once -- it's NS_MAX_POSITIONS * NS_STATE_WORDS
+     * u64 entries, fits on a 64KiB stack but cleaner this way. */
+    ns_state_t *follow = (ns_state_t *)calloc(NS_MAX_POSITIONS, sizeof(ns_state_t));
+    if (!follow) {
+        free(p); free(pos_nodes); node_free(ast);
+        set_err(err, err_cap, "out of memory");
+        return NULL;
+    }
+
     gl_t g = glushkov(ast, follow);
 
     p->flags = flags;
     p->anchor_start = anc_start;
     p->anchor_end   = anc_end;
-    p->n_pos        = (uint8_t)next;
-    p->initial      = g.first;
-    p->accept       = g.last;
-    memcpy(p->follow, follow, sizeof(follow));
+    p->n_pos        = (uint16_t)next;
+    ns_state_copy(p->initial, g.first);
+    ns_state_copy(p->accept,  g.last);
+    for (int i = 0; i < next; i++) ns_state_copy(p->follow[i], follow[i]);
     p->min_len      = g.min_len;
     p->max_len      = g.max_len;
+
+    free(follow);
+
     if (g.nullable && g.min_len == 0) {
-        /* Pattern matches empty input. Refuse, matching upstream's
-         * default behaviour for empty-matching regexes. */
         set_err(err, err_cap,
                 "pattern matches the empty string; refuse to compile");
-        free(p);
-        node_free(ast);
+        free(p); free(pos_nodes); node_free(ast);
         return NULL;
     }
 
-    /* Build byte_pos[c] from each atom node's byte set. */
+    /* Build byte_pos[c] from each atom's byte set. */
     for (int i = 0; i < next; i++) {
         node_t *atom = pos_nodes[i];
-        uint64_t bit = (uint64_t)1 << i;
         for (int c = 0; c < 256; c++) {
-            if (bs_get(atom->bs, c)) p->byte_pos[c] |= bit;
+            if (bs_get(atom->bs, c)) ns_state_setb(p->byte_pos[c], i);
         }
     }
 
-    /* Stash source. */
     p->source = (char *)malloc(n + 1);
-    if (!p->source) { free(p); node_free(ast); set_err(err, err_cap, "oom"); return NULL; }
+    if (!p->source) {
+        free(p); free(pos_nodes); node_free(ast);
+        set_err(err, err_cap, "oom");
+        return NULL;
+    }
     memcpy(p->source, re, n + 1);
 
+    free(pos_nodes);
     node_free(ast);
     return p;
 }
