@@ -1,9 +1,15 @@
-
 build/
 *.o
+*.a
 .DS_Store
 ns
+nanoscan_demo
+hs_compat_demo
+*_test
 *.log
 *.tmp
-tests
-LICENCE
+# Legacy scratch files kept untracked under tests/
+tests/main.c
+tests/test.c
+tests/simd_main.c
+tests/smid_general.c

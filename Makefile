@@ -1,25 +1,46 @@
-# 编译器设置 (Mac 上 cc 默认就是 clang)
-CC = cc
-# 优化选项：-O3 是必须的，-march=native 让编译器针对你的 M1/M2 芯片生成最强代码
-CFLAGS = -O3 -march=native -I./include -Wall
+CC      ?= cc
+CFLAGS  ?= -O3 -Wall -Wextra -Wpedantic
+CPPFLAGS = -I./include -I./src
 
-# 定义目标文件
-SRCS = src/compiler.c src/scanner.c examples/main.c
-OBJS = $(SRCS:.c=.o)
-TARGET = nanoscan_demo
+LIB_SRCS = src/compiler.c src/shift_and.c src/multi_scan.c src/serialize.c src/hs_compat.c
+LIB_OBJS = $(LIB_SRCS:.c=.o)
 
-# 默认规则：编译整个项目
-all: $(TARGET)
+NS_LIB = libnanoscan.a
+HS_LIB = libhs.a
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
+DEMO_NS   = nanoscan_demo
+DEMO_HS   = hs_compat_demo
+TEST_BINS = shift_and_test multi_scan_test hs_compat_test hs_diff_test hs_serialize_test hs_stress_test hs_regex_test hs_many_patterns_test
 
-# 编译每个 .c 文件
+.PHONY: all test clean compat-demo
+
+all: $(NS_LIB) $(HS_LIB) $(DEMO_NS) $(DEMO_HS) $(TEST_BINS)
+
+$(NS_LIB): $(LIB_OBJS)
+	ar rcs $@ $^
+
+# libhs.a is the same archive under the Hyperscan-friendly name (-lhs).
+$(HS_LIB): $(NS_LIB)
+	cp $(NS_LIB) $(HS_LIB)
+
+$(DEMO_NS): examples/main.c $(NS_LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< -L. -lnanoscan
+
+$(DEMO_HS): examples/hs_compat_demo.c $(NS_LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< -L. -lnanoscan
+
+%_test: tests/%.c $(NS_LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< -L. -lnanoscan
+
+test: $(TEST_BINS)
+	@set -e; for t in $(TEST_BINS); do echo "==> $$t"; ./$$t; done
+
+compat-demo: $(DEMO_HS)
+	./$(DEMO_HS)
+
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-# 清理编译结果
 clean:
-	rm -f $(OBJS) $(TARGET)
-
-.PHONY: all clean
+	rm -f $(LIB_OBJS) $(NS_LIB) $(HS_LIB) \
+	      $(DEMO_NS) $(DEMO_HS) $(TEST_BINS)
