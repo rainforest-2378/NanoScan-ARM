@@ -3,7 +3,10 @@
  * of the nanoscan engine. Keeps the public shape and key semantics:
  *   - Per-pattern flag validation (only supported flags accepted).
  *   - HS_FLAG_CASELESS / HS_FLAG_DOTALL / HS_FLAG_SINGLEMATCH honoured.
- *   - HS_FLAG_MULTILINE accepted as a no-op (no ^/$ supported).
+ *   - HS_FLAG_MULTILINE accepted as a no-op (^ / $ already supported at
+ *     the extremes of the pattern).
+ *   - HS_FLAG_SOM_LEFTMOST accepted as a no-op (start-of-match is always
+ *     reported).
  *   - HS_SCAN_TERMINATED returned when a callback aborts the scan.
  *   - hs_compile_error_t carries a human-readable message.
  */
@@ -18,7 +21,7 @@
 
 #define SUPPORTED_FLAGS                                                      \
     (HS_FLAG_CASELESS | HS_FLAG_DOTALL | HS_FLAG_MULTILINE                   \
-     | HS_FLAG_SINGLEMATCH | HS_FLAG_ALLOWEMPTY)
+     | HS_FLAG_SINGLEMATCH | HS_FLAG_ALLOWEMPTY | HS_FLAG_SOM_LEFTMOST)
 
 typedef struct {
     match_event_handler on_event;

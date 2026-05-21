@@ -101,6 +101,21 @@ cmake -S . -B build-vs2019-x64 -G "Visual Studio 16 2019" -A x64 && cmake --buil
 
 Produces `build\Release\nanoscan.lib` and `build\Release\hs.lib`.
 
+### Windows ARM64 "零修改" 兼容保证
+
+业务代码（只 include `<hs/hs.h>` 调 `hs_*` 接口的那部分）不需要任何
+改动即可在 Windows ARM64 / MSVC 下编译链接：
+
+- 头文件是纯标准 C，无 `__attribute__` / GCC 扩展。
+- 内部位运算（如 `ctz64`）走 `_MSC_VER` 分支调 `_BitScanForward64`。
+- 不使用 POSIX-only API（`clock_gettime` / `pthread` / `mmap` 都未使用；
+  测试里的计时已经按 `_WIN32` 切到 `QueryPerformanceCounter`）。
+- 接受全部 Hyperscan 常用 flag：`HS_FLAG_CASELESS` / `DOTALL` /
+  `SINGLEMATCH` / `ALLOWEMPTY` / `MULTILINE`(no-op) /
+  `SOM_LEFTMOST`(no-op，SOM 默认就开)。
+- 链接产物同时输出 `nanoscan.lib` 和 `hs.lib`，原本 `#pragma comment(lib, "hs")`
+  或 link `hs.lib` 的工程一行不用改。
+
 `-march=native` is **off by default** for portability. Enable with
 `cmake -DNANOSCAN_NATIVE=ON ...` (GCC/Clang only) when you control the
 deploy target.

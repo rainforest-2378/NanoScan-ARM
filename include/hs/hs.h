@@ -10,8 +10,9 @@
  *   - Per-pattern flags: HS_FLAG_CASELESS, HS_FLAG_DOTALL, HS_FLAG_MULTILINE,
  *     HS_FLAG_SINGLEMATCH, HS_FLAG_ALLOWEMPTY (the last three are honoured
  *     where meaningful for the supported regex grammar).
- *   - Regex grammar: literal bytes, '.' wildcard, and backslash escapes
- *     (\\., \\\\, \\n, \\r, \\t). Patterns must be 1..64 bytes after parsing.
+ *   - Regex grammar: a PCRE subset (literal bytes, '.', character classes,
+ *     ^ and $ at the extremes, alternation, grouping, quantifiers including
+ *     {n,m} with n+m <= 128). Compiled NFA is held in a 256-bit-wide state.
  *
  * Unsupported features are rejected at compile time with HS_COMPILER_ERROR
  * rather than being silently ignored.
