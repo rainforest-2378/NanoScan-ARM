@@ -226,6 +226,8 @@ static int parse_escape(parser_t *p, byteset_t out) {
         case 't':  bs_set(out, '\t'); return 1;
         case 'f':  bs_set(out, '\f'); return 1;
         case 'v':  bs_set(out, '\v'); return 1;
+        case 'a':  bs_set(out, '\a'); return 1;          /* BEL 0x07 */
+        case 'e':  bs_set(out, 0x1B); return 1;          /* ESC 0x1B */
         case '0':  bs_set(out, '\0'); return 1;
         case 'd':  bs_class_d(out);   return 1;
         case 'D':  bs_class_d(out); bs_negate(out); return 1;
@@ -233,13 +235,47 @@ static int parse_escape(parser_t *p, byteset_t out) {
         case 'W':  bs_class_w(out); bs_negate(out); return 1;
         case 's':  bs_class_s(out);   return 1;
         case 'S':  bs_class_s(out); bs_negate(out); return 1;
-        case '\\': case '.': case '|': case '^': case '$':
-        case '(': case ')': case '[': case ']':
-        case '{': case '}': case '?': case '*': case '+': case '-':
-        case '/':
-            bs_set(out, (uint8_t)e);
+        case 'x': {
+            /* \xHH or \x{HH...} -- single byte value. */
+            int v = 0, ndig = 0;
+            int braced = 0;
+            if (p->i < p->n && p->re[p->i] == '{') { braced = 1; p->i++; }
+            while (p->i < p->n && ndig < 2) {
+                char h = p->re[p->i];
+                int d;
+                if (h >= '0' && h <= '9') d = h - '0';
+                else if (h >= 'a' && h <= 'f') d = 10 + (h - 'a');
+                else if (h >= 'A' && h <= 'F') d = 10 + (h - 'A');
+                else break;
+                v = (v << 4) | d;
+                p->i++;
+                ndig++;
+            }
+            if (ndig == 0) {
+                set_err(p->err, p->err_cap, "\\x requires hex digits");
+                return 0;
+            }
+            if (braced) {
+                if (p->i >= p->n || p->re[p->i] != '}') {
+                    set_err(p->err, p->err_cap, "expected '}' after \\x{..}");
+                    return 0;
+                }
+                p->i++;
+            }
+            bs_set(out, (uint8_t)v);
             return 1;
+        }
         default:
+            /* Lenient: any non-alphanumeric escape (e.g. \: \@ \# \/ \= )
+             * is treated as a literal of that byte.  Alphanumeric escapes
+             * not listed above are rejected so typos like \B or \A still
+             * fail loudly. */
+            if (!((e >= 'a' && e <= 'z') ||
+                  (e >= 'A' && e <= 'Z') ||
+                  (e >= '0' && e <= '9'))) {
+                bs_set(out, (uint8_t)e);
+                return 1;
+            }
             set_err(p->err, p->err_cap,
                     "unsupported escape '\\%c'", e);
             return 0;

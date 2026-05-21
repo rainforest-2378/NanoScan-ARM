@@ -33,7 +33,8 @@ static inline int ns_ctz64(uint64_t x) {
  * Bumping NS_MAX_POSITIONS scales linearly with per-pattern memory
  * (byte_pos[256] dominates: 256 * NS_STATE_WORDS * 8 bytes).
  *
- *   NS_MAX_POSITIONS=256, NS_STATE_WORDS=4   -> ~8 KiB per pattern
+ *   NS_MAX_POSITIONS=256, NS_STATE_WORDS=4   -> ~17 KiB per pattern
+ *                                                (byte_pos[256] dominates)
  *
  * NS_MAX_QUANT_REPEAT caps {n,m} unrolling so the unrolled NFA still
  * fits.  Practical patterns of a few hundred atoms compile fine.
