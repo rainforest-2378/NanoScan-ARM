@@ -86,6 +86,19 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
+### Visual Studio 2019 exact commands
+
+If you are using VS 2019 specifically (generator `Visual Studio 16 2019`),
+use one of these:
+
+```bat
+:: ARM64
+cmake -S . -B build-vs2019-arm64 -G "Visual Studio 16 2019" -A ARM64 && cmake --build build-vs2019-arm64 --config Release && ctest --test-dir build-vs2019-arm64 -C Release --output-on-failure
+
+:: x64
+cmake -S . -B build-vs2019-x64 -G "Visual Studio 16 2019" -A x64 && cmake --build build-vs2019-x64 --config Release && ctest --test-dir build-vs2019-x64 -C Release --output-on-failure
+```
+
 Produces `build\Release\nanoscan.lib` and `build\Release\hs.lib`.
 
 `-march=native` is **off by default** for portability. Enable with
